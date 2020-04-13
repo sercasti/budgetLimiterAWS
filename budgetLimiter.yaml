@@ -1,0 +1,203 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Creates an AWS budget and notifies you when you exceed thresholds, optionally, stop compute instances from a specific tag. Remember billing data is updated daily just once, so no guarantees.
+Parameters:
+  Name:
+    Description: The name of the budget
+    Type: String
+    Default: Budget
+  Amount:
+    Description: What your budget is for the month
+    Type: Number
+  FirstThreshold:
+    Description: The first threshold (percentage) at which you'll receive a notification
+    Type: Number
+    Default: 75
+  SecondThreshold:
+    Description: The second threshold (percentage) at which you'll receive a notification
+    Type: Number
+    Default: 99
+  Email:
+    Description: The email address to send notifications to
+    Type: String
+  Tag:
+    Description: The tag to monitor (key:value)
+    Type: String
+  StopResources:
+    Description: Automatically stop EC2 instances with this tag at SecondThreshold percentage
+    Default: true
+    Type: String
+    AllowedValues: [true, false]
+
+# Order the parameters in a way that makes more sense (not alphabetized)
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Parameters:
+          - Name
+          - Amount
+          - FirstThreshold
+          - SecondThreshold
+          - Email
+          - Tag
+          - StopResources
+
+Conditions:
+  CreateSubscriptionToStopInstances: 
+    !Equals [true, !Ref StopResources]
+
+Resources:
+  BudgetTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateSubscriptionToStopInstances
+    Properties:
+      TopicName: "CreateSubscriptionToStopInstancesOnBudget"
+      DisplayName: AWS Budgets Notification Topic to Stop instances
+  BudgetTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: CreateSubscriptionToStopInstances
+    Properties:
+      Topics:
+        - !Ref BudgetTopic
+      PolicyDocument:
+        Statement:
+          - Sid: AWSBudgetsSNSPolicy
+            Action:
+              - sns:Publish
+            Effect: Allow
+            Principal:
+              Service:
+                - budgets.amazonaws.com
+            Resource: !Ref BudgetTopic
+
+  LambdaStopPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: CreateSubscriptionToStopInstances
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'ec2:Stop*'
+              - 'ec2:Describe*'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Resource: '*'
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: CreateSubscriptionToStopInstances
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - !Ref LambdaStopPolicy
+
+  Budget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Ref Name
+        BudgetLimit:
+          Amount: !Ref Amount
+          Unit: "USD"
+        #CalculatedSpend (forecast) not yet supported on CloudFormation.
+        TimeUnit: MONTHLY
+        BudgetType: COST
+        CostFilters: 
+          TagKeyValue: 
+            - !Sub
+              - 'user:${lallave}$${elvalor}'
+              - lallave: !Select [0, !Split [ ":" , !Ref Tag ]]
+                elvalor: !Select [1, !Split [ ":" , !Ref Tag ]]
+      NotificationsWithSubscribers:
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: !Ref FirstThreshold
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref Email
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: !Ref SecondThreshold
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref Email
+            - SubscriptionType: SNS
+              Address: !If [CreateSubscriptionToStopInstances, !Ref BudgetTopic, !Ref "AWS::NoValue"]
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: FORECASTED
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref Email
+
+  LambdaInstancesStopperByTag:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: 
+        Fn::GetAtt:
+        - LambdaExecutionRole
+        - Arn
+      Runtime: "python3.7"
+      Environment:
+        Variables:
+          tagToStop: !Ref Tag
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          ec2 = boto3.resource('ec2')
+
+          def lambda_handler(event, context):
+            print("Event: " + json.dumps(event))
+            tagToStopValue = os.environ['tagToStop']
+            tagFilterName = "tag:" + tagToStopValue.split(":")[0]
+            tagFilterValue = tagToStopValue.split(":")[1]
+
+            filters = [{
+                  'Name': tagFilterName,
+                  'Values': [tagFilterValue]
+                },
+                {
+                  'Name': 'instance-state-name',
+                  'Values': ['running']
+              }]
+            #filter the instances
+            instances = ec2.instances.filter(Filters=filters)
+
+            #locate all running instances
+            RunningInstances = [instance.id for instance in instances]
+            
+            #make sure there are actually instances to shut down. 
+            if len(RunningInstances) > 0:
+                #perform the shutdown
+                shuttingDown = ec2.instances.filter(InstanceIds=RunningInstances).stop()
+                print (shuttingDown)
+            else:
+                print ("Nothing to see here")
+
+
+Outputs:
+  TagValue:
+    Description: The tag being monitored
+    Value: !Sub
+              - 'user:${lallave}$${elvalor}'
+              - lallave: !Select [0, !Split [ ":" , !Ref Tag ]]
+                elvalor: !Select [1, !Split [ ":" , !Ref Tag ]]
