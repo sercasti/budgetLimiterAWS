@@ -52,6 +52,20 @@ Resources:
     Properties:
       TopicName: "CreateSubscriptionToStopInstancesOnBudget"
       DisplayName: AWS Budgets Notification Topic to Stop instances
+      Subscription: 
+        - Endpoint": !GetAtt LambdaInstancesStopperByTag.Arn
+          Protocol: lambda
+    DependsOn: 
+      - "LambdaInstancesStopperByTag" 
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt LambdaInstancesStopperByTag.Arn
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref BudgetTopic
+  
   BudgetTopicPolicy:
     Type: AWS::SNS::TopicPolicy
     Condition: CreateSubscriptionToStopInstances
@@ -82,6 +96,8 @@ Resources:
               - 'ec2:Describe*'
               - 'logs:CreateLogStream'
               - 'logs:PutLogEvents'
+              - 'logs:CreateLogGroup'
+              - 'logs:GetLogEvents'
             Resource: '*'
 
   LambdaExecutionRole:
@@ -100,6 +116,7 @@ Resources:
       Path: /
       ManagedPolicyArns:
         - !Ref LambdaStopPolicy
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
 
   Budget:
     Type: AWS::Budgets::Budget
